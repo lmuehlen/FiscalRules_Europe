@@ -1,0 +1,228 @@
+---
+title: "Building_the_dataset2"
+author: "Leo Mühlenweg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages
+```{r, message=FALSE}
+library(devtools)
+
+install_github("lmuehlen/fiscalrules.project")
+library(fiscalrules.project)
+```
+
+# Creating the fiscal rules stringency index
+
+## Data basis
+First, I build a fiscal rules stringency index based on partially ordered set theory (POSET). For this, I use the fantastic parsec library. 
+The European Commission's Fiscal rules database serves as the data basis, whereby I adapt the data of the new methodology from 2015 so that I can use the new and old methodology together. The observation period thus covers 1990 to 2019.In order to be able to read in the data, minimal format adjustments are necessary in Excel. At no time was any data changed.
+The data can be downloaded from the following link: https://ec.europa.eu/info/publications/fiscal-rules-database_en
+
+First, I load the data based on the old methodology.
+It is necessary to use two sheets of the database to combine the information about the properties of the rules and their application period.
+For property C3, I bundle two properties to ensure that the POSET is still computable.
+However, I will write about the characteristics of the fiscal rules in more detail later.
+To see the definition of the function use F2.
+```{r old methodology, message=FALSE, warning=FALSE}
+
+ec_frd2015<-prep_eucom_fiscalrules2015("Daten/ec_frd2015.xlsx","dfs/ec_frd2015")
+```
+
+In a similar vein, we are dealing with the data from the new methodology that forms the basis for the years 2016 to 2019. Here, a few adjustments to the numerical values are necessary so that there is no break between 2015 and 2016. The ordinal structure remains the same, however, and this is the relevant aspect for an index based on POSET (see paper).
+
+```{r new methodology, message=FALSE, warning=FALSE}
+ec_frd2019<-prep_eucom_fiscalrules2019("Daten/ec_frd2019.xlsx","dfs/ec_frd2019")
+```
+
+In the following, the two datasets are combined.
+
+```{r join datasets}
+
+ec_frd<-rbind(ec_frd2015,ec_frd2019)%>%
+  mutate(across(c(C1,C2,C3,C4),~case_when(is.na(.)~0,
+                                           TRUE~.)))
+saveRDS(ec_frd,"dfs/ec_frd")
+DT::datatable(ec_frd,
+              options = list(scrollX=TRUE))
+```
+
+
+The four properties underlying the index of fiscal rules are defined as follows:
+
+| Variable | Property                                                                               | Meaning values                                                                                                                                                                                                                 |
+|:----------|:----------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| C1       | legal basis                                                                            | 4 = constitutional base<br>3 = legal act<br>2 = coalition agreement<br>1 = political commitment                                                                                                                                |
+| C2       | Room for setting or revising objectives                                                | 3 = no margin for adjusting objectives<br>2 = some but constrained margin<br>1 = complete freedom in setting objectives                                                                                                        |
+| C3       | Nature of the body in charge of<br>monitoring respect and <br>enforcement of the rule  | 3 = monitoring and enforcement<br>2 = monitoring and/or enforcement<br>1 = no monitoring, no enforcement                                                                                                                       |
+| C4       | Enforcement mechanisms of the rule                                                     | 3 =triggered automatically or scope is predefined<br>2 = actions must be taken or presented to parliament<br>1 = no ex-ante defined actions in case of non-compliance |
+
+The respective values are to be interpreted strictly ordinally.
+
+## Creating the index
+First, all observed profiles and their frequencies are generated based on the data set. Subsequently, these are merged with the possible profiles which are not observed within the data. 
+The profile "0000" indicates that there is no fiscal rule.
+The index is then calculated. For more information on the theory behind the index and the procedure, it is worth taking a look at the paper.
+```{r creation poset, r,eval=FALSE}
+index_variables<-list(
+    C1 = c(0, 1, 2, 3, 4), # 0 means no fiscal rule in place
+    C2 = c(0, 1, 2, 3),
+    C3 = c(0, 1, 2, 3),
+    C4 = c(0, 1, 2, 3)
+  )
+
+#use F2 to view function
+get_poset_fiscalrules("dfs/ec_frd",index_variables,"dfs/eval_ec_frd")
+```
+
+
+The average ranks of the respective profiles are normalized and linked to the observed fiscal rule profiles. In addition, a dummy variable is generated indicating whether the respective government sector (general government, central government, regional government, local government, social security) is affected by the fiscal rules. 
+```{r}
+rm(list=ls())
+eval2 <- readRDS("dfs/eval_ec_frd")
+
+ddpcr::quiet(
+s_eval <- summary(eval2) %>% select(C1, C2, C3, C4, av_rank = `average rank`)
+)
+
+ec_frd1 <- readRDS("dfs/ec_frd")%>%
+  mutate(across(c(C1,C2,C3,C4),~case_when(is.na(.)~0,
+                                           TRUE~.)))%>%
+  distinct(no,countrycode,year,.keep_all = T)#Keep only the entries where at least one of rule number, country code and year is different
+
+
+ec_frd2 <- left_join(ec_frd1, s_eval, by = c("C1", "C2", "C3", "C4")) %>%
+  mutate(
+    
+    #normalisation of index
+    frsi = 10*(1 - av_rank / max(av_rank, na.rm = T)),
+    
+    #changing countrycode from iso2c to iso3c
+    countrycode = countrycode(countrycode, "iso2c", "iso3c", custom_match = c("UK" = "GBR", "EL" = "GRC")),
+    
+    #generating dummy variable for affected government sector
+    general_government = case_when(
+      grepl("GG", sector) ~ 1,
+      !grepl("GG", sector) ~ 0
+    ),
+    central_government = case_when(
+      grepl("CG", sector) ~ 1,
+      !grepl("CG", sector) ~ 0
+    ),
+    regional_government = case_when(
+      grepl("RG", sector) ~ 1,
+      !grepl("RG", sector) ~ 0
+    ),
+    local_government = case_when(
+      grepl("LG", sector) ~ 1,
+      !grepl("LG", sector) ~ 0
+    ),
+    social_security = case_when(
+      grepl("SS", sector) ~ 1,
+      !grepl("SS", sector) ~ 0
+    ),
+    subnational_governement=case_when(
+      grepl("LG|RG",sector)~1,
+      !grepl("LG|RG",sector)~0
+    )
+  ) %>%
+  select(countrycode, year,
+    rule_number = no, type,
+    general_government, central_government, regional_government, local_government, social_security,subnational_governement,
+    frsi, Exclusions)
+saveRDS(ec_frd2,"dfs/ec_frd2")
+
+DT::datatable(ec_frd2,
+              options = list(scrollX=TRUE))
+```
+
+However, there is still the problem that there are a few cases in which the government sector of a country is affected by several fiscal rules in one year. In this case, I have decided to take the maximum value. It would not be plausible to take the mean. Imagine the case where an additional fiscal rule is introduced in a country that has a lower index value than the previous one. If the mean were used, this would mean a reduction in the overall index. 
+Using the maximum value is also not optimal, since it can be assumed that the additional rule should actually increase the value. However, aggregation is necessary and max() seems to be the best solution.
+
+For Exclusions I will the value of the fiscal rule with the maximum value.
+```{r}
+ec_pan <- function(sector, sector_ab) {
+  ec_frd2<-readRDS("dfs/ec_frd2")
+  x<-ec_frd2%>%pivot_wider(names_from = type,values_from = frsi)%>%filter({{sector}}==1)%>%#this rather complicated reshaping is necessary since we would lose some types of fiscal rules otherwise
+    select(countrycode,year,rule_number,Exclusions,matches("government|social"),BBR,DR,ER,RR)%>%
+    pivot_longer(c(BBR,DR,ER,RR),names_to = "type",values_to = "frsi")%>%
+    mutate(frsi=case_when(is.na(frsi)~0,
+                          TRUE~frsi))%>%
+    group_by(countrycode,year,type)%>%
+    filter(frsi==max(frsi))%>%
+    select(c("countrycode","year","type"),everything())
+  
+  
+    
+  y<-tidyr::crossing(ec_frd2$countrycode,ec_frd2$year,ec_frd2$type)%>%#all possible combinations of countrycode,year and type (base of merge)
+    select(countrycode=`ec_frd2$countrycode`,year=`ec_frd2$year`,type=`ec_frd2$type`)%>%
+    filter(!is.na(type))
+  
+  merge<-left_join(y,x,by=c("countrycode","year","type"))%>%
+    mutate(sector=sector_ab,
+           frsi=case_when(is.na(frsi)~0,
+                          TRUE~frsi))%>%
+   pivot_wider(names_from = type,values_from = frsi)
+  
+return(merge)
+}
+
+ddpcr::quiet(
+fr_list<-list(
+lg=ec_pan(local_government, "lg"),
+rg=ec_pan(regional_government, "rg"),
+cg=ec_pan(central_government, "cg"),
+gg=ec_pan(general_government, "gg"),
+ss=ec_pan(social_security, "ss"),
+sng=ec_pan(subnational_governement, "sng")
+)
+)
+```
+
+
+
+In the final step of index creation, I calculate an overall index that combines the different fiscal rule types (BBR,DR,ER,RR). For this purpose, I again use the partially ordered set theory, but apply it only to the actually observed combinations.
+
+
+(if one would want to review the effect of exclusions it would be necessary to include theme here as dummy variables for each fiscal rule on each level. I will not do that since I will focus on the combined fiscal rules index, where it would not be feasible to use exclusions as a dummy variable)
+```{r,eval=FALSE}
+frd<-lapply(fr_list,function(x){
+eval <- x %>%
+  select(BBR, DR, ER, RR) %>%
+  pop2prof() %>%
+  evaluation(threshold = "0000", error = 10^(-3))
+
+s_eval <- eval %>%
+  summary() %>%
+  select(BBR, DR, ER, RR, "full" = "average rank") 
+s_eval$full <- (1 - s_eval$full / max(s_eval$full, na.rm = T))
+
+left_join(x, s_eval, by = c("BBR", "DR", "ER", "RR"))%>%
+  rename_with(~gsub("(.*)",paste0("frd_",x$sector[1],"_\\1"),.)%>%tolower(),-c(countrycode,year,sector))%>%
+  select(-sector)
+}
+)
+saveRDS(frd, "dfs/frd")
+
+
+frd<-readRDS("dfs/frd")
+frd_final<-plyr::join_all(frd,by=c("countrycode","year"))%>%
+  dplyr::mutate(across(dplyr::matches("^frd"),~.*10,.names = "{.col}"))
+ 
+saveRDS(frd_final,"dfs/frd_final") 
+
+```
+The logic of the variable names is the following: frd_{government sector}_{fiscal rule type}
+```{r,echo=FALSE}
+frd_final<-readRDS("dfs/frd_final")
+DT::datatable(frd_final,
+              options = list(scrollX=TRUE))
+```
+
+
+
